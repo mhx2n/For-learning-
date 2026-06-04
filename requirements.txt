@@ -16,9 +16,7 @@ pymongo[srv]==4.7.2
 
 # Optional: only if you enable DeepSeek/OpenRouter support
 
-# openai>=1.30.0,
-
-<2.0.0
+# openai>=1.30.0,<2.0.0
 
 
 
