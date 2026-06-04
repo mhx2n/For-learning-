@@ -85,37 +85,47 @@ async def add_page_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not context.args:
         await update.message.reply_text(
-            "📌 ব্যবহার: `/addpage <Facebook Page URL বা Username>`\n\nউদাহরণ:\n`/addpage https://facebook.com/pagename`",
+            "📌 ব্যবহার: `/addpage <Facebook Page/Group URL>`\n\n"
+            "উদাহরণ:\n"
+            "`/addpage https://facebook.com/pagename`\n"
+            "`/addpage https://www.facebook.com/groups/groupname/`\n"
+            "`/addpage https://www.facebook.com/share/18rwZL6t6x/`",
             parse_mode="Markdown"
         )
         return
-    page_input = context.args[0].strip()
-    if "facebook.com/" in page_input:
-        # share link থেকে slug বের করো
-        # https://www.facebook.com/share/18rwZL6t6x/ → 18rwZL6t6x
-        # https://www.facebook.com/pagename/ → pagename
-        parts = page_input.rstrip("/").split("/")
-        # "share" থাকলে সেটার পরের অংশ
-        if "share" in parts:
-            idx = parts.index("share")
-            page_slug = parts[idx + 1] if idx + 1 < len(parts) else parts[-1]
-        else:
-            page_slug = parts[-1]
-    else:
-        page_slug = page_input
 
-    page_url = f"https://www.facebook.com/{page_slug}"
+    page_input = context.args[0].strip()
+
+    # Advanced URL cleanup — ?ref=share&mibextid=NSMWBT সহ সব handle করে
+    from facebook_scraper import FacebookScraper as _FS
+    clean_url, page_slug, is_group = _FS.clean_fb_url(page_input)
+
+    if not page_slug:
+        await update.message.reply_text("❌ সঠিক Facebook URL দাও।")
+        return
+
+    page_type = "Group" if is_group else "Page"
+
+    # Duplicate check (slug দিয়ে)
     existing = db.get_page_by_slug(page_slug)
     if existing:
         await update.message.reply_text(
-            f"⚠️ এই Page ইতিমধ্যে যোগ করা আছে।\nID: `{existing['id']}`",
+            f"⚠️ এই {page_type} ইতিমধ্যে যোগ করা আছে।\nID: `{existing['id']}`",
             parse_mode="Markdown"
         )
         return
-    page_id = db.add_page(page_slug, page_url, user.id)
+
+    # original full URL সেভ করো (মূল URL, clean mbasic URL নয়)
+    original_url = page_input if "facebook.com" in page_input else f"https://www.facebook.com/{page_slug}"
+
+    page_id = db.add_page(page_slug, original_url, user.id)
     await update.message.reply_text(
-        f"✅ Page যোগ হয়েছে!\n\n🔗 URL: {page_url}\n🆔 ID: `{page_id}`\n\n"
-        f"💡 এখন `/fetch` দিয়ে নতুন পোস্ট অথবা\n`/fetchold {page_slug}` দিয়ে পুরোনো পোস্টও আনতে পারো।",
+        f"✅ {page_type} যোগ হয়েছে!\n\n"
+        f"🔗 Slug: `{page_slug}`\n"
+        f"🆔 ID: `{page_id}`\n"
+        f"{'👥 Group' if is_group else '📄 Page'}: সক্রিয়\n\n"
+        f"💡 এখন `/fetch` দিয়ে নতুন পোস্ট অথবা\n"
+        f"`/fetchold {page_slug}` দিয়ে পুরোনো পোস্টও আনতে পারো।",
         parse_mode="Markdown"
     )
 
@@ -265,6 +275,34 @@ async def set_token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+
+async def fixpages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DB-তে থাকা dirty URL/slug গুলো clean করো"""
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("❌ শুধু Owner এটা করতে পারবে।")
+        return
+    from facebook_scraper import FacebookScraper as _FS
+    pages = db.get_all_pages()
+    fixed = []
+    for page in pages:
+        old_slug = page["slug"]
+        old_url = page.get("url", "")
+        _, new_slug, is_group = _FS.clean_fb_url(old_url or old_slug)
+        if new_slug and new_slug != old_slug:
+            with db._conn() as conn:
+                conn.execute("UPDATE pages SET slug=? WHERE id=?", (new_slug, page["id"]))
+                conn.commit()
+            fixed.append("ID:" + str(page["id"]) + " `" + old_slug + "` → `" + new_slug + "`")
+    if fixed:
+        count = len(fixed)
+        lines = "\n".join(fixed)
+        msg = f"✅ {count}টি Page fix হয়েছে:\n{lines}"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("✅ সব Page ইতিমধ্যে সঠিক আছে।")
+
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_owner_or_admin(user.id):
@@ -387,11 +425,13 @@ async def fetch_and_queue_posts(
 
     for page in pages:
         try:
+            # DB-তে dirty slug/URL থাকলেও scraper নিজেই clean করে নেবে
+            page_url_for_fetch = page.get('url') or page['slug']
             posts = await scraper.fetch_posts(
-                page["slug"],
-                page["url"],
+                page['slug'],
+                page_url_for_fetch,
                 fetch_old=fetch_old,
-                max_pages=5 if fetch_old else 1,  # পুরোনো আনলে বেশি page
+                max_pages=5 if fetch_old else 2,
             )
             db.add_bandwidth_usage(scraper.last_request_bytes)
 
@@ -468,6 +508,7 @@ async def main():
     app.add_handler(CommandHandler("fetchold", fetch_old_cmd))   # ← নতুন
     app.add_handler(CommandHandler("settoken", set_token_cmd))   # ← নতুন
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("fixpages", fixpages_cmd))   # ← dirty slug fix
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, edit_message_handler))
 
