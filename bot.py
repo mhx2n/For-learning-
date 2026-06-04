@@ -403,7 +403,22 @@ def main():
 
     db.init()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Scheduler — post_init callback-এ শুরু করো
+    # (event loop তৈরির পরে চালাতে হয়, তাই এখানে define করছি)
+    async def post_init(application):
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(
+            scheduled_fetch,
+            "interval",
+            minutes=FETCH_INTERVAL_MINUTES,
+            args=[application.bot],
+            next_run_time=datetime.now() + timedelta(minutes=1)
+        )
+        scheduler.start()
+        logger.info(f"✅ Scheduler শুরু — প্রতি {FETCH_INTERVAL_MINUTES} মিনিটে fetch করবে।")
+
+    # Application তৈরি
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Handlers
     app.add_handler(CommandHandler("start", start_cmd))
@@ -416,18 +431,6 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, edit_message_handler))
-
-    # Scheduler
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        scheduled_fetch,
-        "interval",
-        minutes=FETCH_INTERVAL_MINUTES,
-        args=[app.bot],
-        next_run_time=datetime.now() + timedelta(minutes=1)
-    )
-    scheduler.start()
-    logger.info(f"✅ Scheduler শুরু — প্রতি {FETCH_INTERVAL_MINUTES} মিনিটে fetch করবে।")
 
     # Webhook mode for Render (production)
     webhook_url = os.environ.get("WEBHOOK_URL", "")
